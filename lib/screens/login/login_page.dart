@@ -5,6 +5,7 @@ import '../../widgets/custom_button.dart';
 import '../../widgets/loading_overlay.dart';
 import '../home/home_page.dart';
 import '../../services/api_errors.dart';
+import '../../services/api_errors.dart';
 
 class LoginPage extends StatefulWidget {
   static const routeName = "/login";
@@ -15,22 +16,22 @@ class LoginPage extends StatefulWidget {
 }
 
 class _LoginPageState extends State<LoginPage> {
-  final _userCtrl = TextEditingController(text: "amr@system");
+  final _idCtrl = TextEditingController(text: "amr@system");         // หรือ user@example.com
   final _passCtrl = TextEditingController(text: "amr@Passw0rd");
   bool _loading = false;
   String? _error;
 
   Future<void> _onLogin() async {
     try {
-      setState(() {
-        _loading = true;
-        _error = null;
-      });
+      setState(() { _loading = true; _error = null; });
 
+      final id = _idCtrl.text.trim();
+      // เดิม: final isEmail = id.contains('@');
       final ok = await context.read<AuthProvider>().login(
-            _userCtrl.text.trim(),
-            _passCtrl.text,
-          );
+        username: id,                         // ✅ ส่ง username เสมอ
+        email: null,                          // ❌ ไม่ใช้ email แล้ว
+        password: _passCtrl.text,
+      );
 
       if (!mounted) return;
       setState(() => _loading = false);
@@ -39,15 +40,9 @@ class _LoginPageState extends State<LoginPage> {
         Navigator.pushReplacementNamed(context, HomePage.routeName);
       }
     } on ApiException catch (e) {
-      setState(() {
-        _loading = false;
-        _error = e.toString();
-      });
+      setState(() { _loading = false; _error = e.toString(); });
     } catch (e) {
-      setState(() {
-        _loading = false;
-        _error = 'Unexpected: $e';
-      });
+      setState(() { _loading = false; _error = 'Unexpected: $e'; });
     }
   }
 
@@ -57,7 +52,7 @@ class _LoginPageState extends State<LoginPage> {
 
     return Scaffold(
       appBar: AppBar(title: const Text("Login")),
-      resizeToAvoidBottomInset: true, // ✅ ให้เลื่อนอัตโนมัติเมื่อคีย์บอร์ดขึ้น
+      resizeToAvoidBottomInset: true,
       body: LoadingOverlay(
         loading: _loading,
         child: SafeArea(
@@ -67,7 +62,7 @@ class _LoginPageState extends State<LoginPage> {
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
                 TextField(
-                  controller: _userCtrl,
+                  controller: _idCtrl, // ← เปลี่ยนจาก _userCtrl เป็น _idCtrl
                   decoration: const InputDecoration(
                     labelText: "Username",
                     prefixIcon: Icon(Icons.person),
@@ -102,4 +97,12 @@ class _LoginPageState extends State<LoginPage> {
       ),
     );
   }
+
+  @override
+  void dispose() {
+    _idCtrl.dispose();
+    _passCtrl.dispose();
+    super.dispose();
+  }
+
 }

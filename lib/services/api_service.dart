@@ -1,23 +1,19 @@
-import 'dart:convert';
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 import 'package:http/http.dart' as http;
 
-import '../models/user.dart';
 import '../core/constants.dart';
+import '../models/user.dart';
 import 'api_errors.dart';
 
 class ApiService {
   final http.Client _client;
   ApiService({http.Client? client}) : _client = client ?? http.Client();
 
-  // Cookie jar แบบง่าย
+  // ===== Cookie Jar แบบง่าย =====
   final Map<String, String> _cookieJar = {};
-
-  // ใช้ใน AuthProvider เพื่อบันทึก cookie ลง storage
   Map<String, String> cookiesSnapshot() => Map<String, String>.from(_cookieJar);
-
-  // ใช้ใน AuthProvider เพื่อ restore cookie จาก storage
   void loadCookies(Map<String, String> cookies) {
     _cookieJar
       ..clear()
@@ -33,6 +29,7 @@ class ApiService {
     final setCookie = resp.headers['set-cookie'];
     if (setCookie == null || setCookie.isEmpty) return;
 
+    // split แบบง่าย
     final parts = setCookie.split(',');
     for (final raw in parts) {
       final seg = raw.split(';').first.trim();
@@ -46,48 +43,73 @@ class ApiService {
       }
     }
   }
-
-  String _basicAuthHeader(String username, String password) {
-    final raw = '$username:$password';
-    final token = base64Encode(utf8.encode(raw));
-    return 'Basic $token';
+  Future<void> _warmupCsrf() async {
+    // ไป GET หน้าใดหน้าหนึ่งที่ปล่อย csrftoken (เลือก /api/auth/login/ ตรง ๆ)
+    final uri = Uri.parse('${AppConstants.apiBaseUrl}/api/auth/login/');
+    try {
+      final resp = await _client.get(uri, headers: {
+        'Accept': 'application/json',
+        if (_cookieHeader() != null) 'Cookie': _cookieHeader()!,
+      }).timeout(const Duration(seconds: 10));
+      _updateCookiesFromResponse(resp); // จะได้ csrftoken, sessionid ถ้ามี
+    } catch (_) {/* ignore */}
   }
 
-  Future<String> _getTokenByBasicAuth({
-    required String username,
+  String? _csrfFromCookie() {
+    return _cookieJar['csrftoken'] ?? _cookieJar['csrf'] ?? _cookieJar['csrf_token'];
+  }
+  // ========= NEW AUTH FLOW =========
+
+  /// Login แบบใหม่ (API auth): ส่ง username หรือ email + password
+  /// ถ้า response ไม่มี token จะคืน token เป็น '' แล้วใช้ session cookie เป็นหลัก
+  /// Login ใหม่: ส่งแบบฟอร์ม + CSRF
+  Future<User> loginWithCredentials({
+    String? username,
+    String? email,            // ยังรับไว้เพื่อไม่พัง signature แต่จะไม่ใช้แล้ว
     required String password,
   }) async {
-    final uri = Uri.parse('${AppConstants.apiBaseUrl}/api/user/token/');
+    final id = (username ?? '').trim();   // ✅ ใช้เฉพาะ username
+    final uri = Uri.parse('${AppConstants.apiBaseUrl}/api/auth/login/');
 
     try {
-      final headers = <String, String>{
-        'Authorization': _basicAuthHeader(username, password),
-        'Accept': 'application/json',
-      };
-      final cookie = _cookieHeader();
-      if (cookie != null) headers['Cookie'] = cookie;
+      final request = http.MultipartRequest('POST', uri);
+      request.fields.addAll({
+        'username': id,                   // ✅ ส่ง username เท่านั้น
+        'password': password.trim(),
+      });
+      // ไม่ส่ง Cookie ตอน login
+      final streamed = await request.send().timeout(const Duration(seconds: 15));
 
-      // ✅ กลับมาใช้ GET ตาม backend
-      final resp = await _client
-          .get(uri, headers: headers)
-          .timeout(const Duration(seconds: 12));
-
-      _updateCookiesFromResponse(resp);
-
-      if (resp.statusCode == 200) {
-        final data = jsonDecode(resp.body) as Map<String, dynamic>;
-        final token = data['token'] as String?;
-        if (token == null || token.isEmpty) {
-          throw ApiException('Token not found in response', statusCode: 200);
+      // อัปเดต cookie จาก response
+      final setCookieHeader = streamed.headers['set-cookie'];
+      if (setCookieHeader != null && setCookieHeader.isNotEmpty) {
+        final parts = setCookieHeader.split(',');
+        for (final raw in parts) {
+          final seg = raw.split(';').first.trim();
+          final idx = seg.indexOf('=');
+          if (idx > 0) {
+            _cookieJar[seg.substring(0, idx).trim()] =
+                seg.substring(idx + 1).trim();
+          }
         }
-        return token;
-      } else if (resp.statusCode == 401) {
-        throw ApiException('Invalid credentials', statusCode: 401);
+      }
+
+      final body = await streamed.stream.bytesToString();
+
+      if (streamed.statusCode == 200) {
+        String token = '';
+        try {
+          if (body.isNotEmpty) {
+            final data = jsonDecode(body) as Map<String, dynamic>;
+            token = (data['token'] ?? data['key'] ?? '').toString();
+          }
+        } catch (_) {}
+        return await getUser(tokenHint: token);
+      } else if (streamed.statusCode == 400 || streamed.statusCode == 401) {
+        throw ApiException('Invalid credentials', statusCode: streamed.statusCode);
       } else {
-        throw ApiException(
-          'Token request failed (${resp.statusCode}): ${resp.body}',
-          statusCode: resp.statusCode,
-        );
+        throw ApiException('Login failed (${streamed.statusCode}): $body',
+            statusCode: streamed.statusCode);
       }
     } on SocketException {
       throw ApiException('Network error: cannot reach ${uri.host}.');
@@ -98,15 +120,16 @@ class ApiService {
     }
   }
 
-  Future<User> _getMeWithBearer(String bearerToken) async {
-    final uri = Uri.parse('${AppConstants.apiBaseUrl}/api/user/me/');
+  /// ดึงข้อมูลผู้ใช้ปัจจุบัน: GET /api/auth/user/
+  Future<User> getUser({String tokenHint = ''}) async {
+    final uri = Uri.parse('${AppConstants.apiBaseUrl}/api/auth/user/');
     try {
       final headers = <String, String>{
-        'Authorization': 'Bearer $bearerToken',
         'Accept': 'application/json',
       };
       final cookie = _cookieHeader();
       if (cookie != null) headers['Cookie'] = cookie;
+      if (tokenHint.isNotEmpty) headers['Authorization'] = 'Bearer $tokenHint';
 
       final resp = await _client.get(uri, headers: headers).timeout(
             const Duration(seconds: 12),
@@ -116,25 +139,18 @@ class ApiService {
 
       if (resp.statusCode == 200) {
         final data = jsonDecode(resp.body) as Map<String, dynamic>;
-        final username = (data['username'] ?? '') as String;
-        final firstName = (data['first_name'] ?? '') as String;
-        final lastName = (data['last_name'] ?? '') as String;
-        final email = (data['email'] ?? '') as String;
-        print('DEBUG /me -> username=$username, first=$firstName, last=$lastName, email=$email');
-        print('$resp.body');
-        print('$data');
         return User(
-          username: username,
-          firstName: firstName,
-          lastName: lastName,
-          email: email,
-          token: bearerToken,
+          username: (data['username'] ?? '').toString(),
+          firstName: (data['first_name'] ?? '').toString(),
+          lastName: (data['last_name'] ?? '').toString(),
+          email: (data['email'] ?? '').toString(),
+          token: tokenHint, // อาจว่างได้
         );
       } else if (resp.statusCode == 401) {
-        throw ApiException('Token invalid or expired', statusCode: 401);
+        throw ApiException('Unauthorized (need login)', statusCode: 401);
       } else {
         throw ApiException(
-          'Get /me failed (${resp.statusCode}): ${resp.body}',
+          'Get user failed (${resp.statusCode}): ${resp.body}',
           statusCode: resp.statusCode,
         );
       }
@@ -147,18 +163,26 @@ class ApiService {
     }
   }
 
-  Future<User> getMeWithBearer(String bearerToken) async {
-    return _getMeWithBearer(bearerToken);
-  }
+  /// Logout: POST /api/auth/logout/ (หรือลอง GET ถ้าจำเป็น)
+  Future<void> logout() async {
+    final uri = Uri.parse('${AppConstants.apiBaseUrl}/api/auth/logout/');
+    try {
+      final headers = <String, String>{
+        'Accept': 'application/json',
+      };
+      final cookie = _cookieHeader();
+      if (cookie != null) headers['Cookie'] = cookie;
 
-  Future<User> login(String username, String password) async {
-    final token = await _getTokenByBasicAuth(username: username, password: password);
-    final user = await _getMeWithBearer(token);
-    return user;
-  }
+      final resp = await _client
+          .post(uri, headers: headers)
+          .timeout(const Duration(seconds: 10));
 
-  Future<void> logout(String bearerToken) async {
-    await Future<void>.delayed(const Duration(milliseconds: 200));
-    _cookieJar.clear();
+      _updateCookiesFromResponse(resp);
+      // ไม่ว่า status อะไร เราจะล้าง cookie ฝั่ง client อยู่ดี
+    } catch (_) {
+      // ignore network error ตอน logout ฝั่ง client
+    } finally {
+      _cookieJar.clear();
+    }
   }
 }
